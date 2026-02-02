@@ -9,6 +9,10 @@ disaster_ai_sp26/
 !schema.yaml
 !config.json
 
+## Documentation & Plans (Local only)
+Guides/
+plan/
+
 ## Python
 __pycache__/
 *.py[cod]
