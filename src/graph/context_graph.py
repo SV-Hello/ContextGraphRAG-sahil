@@ -16,7 +16,7 @@ class ContextGraph:
         self.df_metrics = None
 
     """Load metrics and tables"""
-    def load_data_dictionary(self, excel_path: str):
+    def load_data_dictionary(self, excel_path: str, duckdb_path: str):
         import pandas as pd
 
         df_tables = pd.read_excel(excel_path, sheet_name = 0)
@@ -34,15 +34,18 @@ class ContextGraph:
         print("Linking concepts to features...")
         self._link_hazards_to_features()
 
+        print("Enriching with DuckDB columns...")
+        self.enrich_from_duckdb(duckdb_path)
+
         print("Data dictionary loaded!")
 
     """Load (realtime) table rows as Feature nodes"""
     def _load_tables(self, df):
 
-        for _, row in df,iterrows():
+        for _, row in df.iterrows():
             #Value Extration
             table_name = row['Cube Data Model Name']
-            name = row['name']
+            name = row['Name']
             hazard_type = row['Hazard Type']
             data_type = row['Data Type']
             risk_component = row['Risk component']
@@ -57,7 +60,7 @@ class ContextGraph:
                 name=name,
                 source='database',
                 aggregation='real_time',
-                description=description
+                description=desc
             )
 
     """Load (static) metric rows as Feature nodes"""
@@ -79,7 +82,7 @@ class ContextGraph:
             self.create_feature(
                 feature_id = feature_id,
                 name = name,
-                source = 'parquet',
+                source = 'duckdb',
                 aggregation = 'h3_l8',
                 description = desc
             )
@@ -97,19 +100,19 @@ class ContextGraph:
             'Not hazard-specific': ['general', 'infrastructure', 'baseline']
         }
 
-    """Making unique concept nods for each distinct hazard type"""
-    def __create_hazard_concepts(self, df_metrics, df_tables):
-        hazard_metrics = df_metrics['Hazard Type'].dropna().unique()
-        hazards_tables = df_tables['Hazard Type'].dropna().unique()
+        return synonym_map.get(hazard_type, [hazard_type.lower()])
 
-        #Combine and deduplicate
-        all_hazards = set(list(hazard_metrics) + list(hazards_tables))
+    """Making unique concept nods for each distinct hazard type"""
+    def _create_hazard_concepts(self, df_metrics, df_tables):
+        hazard_metrics = df_metrics['Hazard Type'].dropna().unique()
+        hazard_tables = df_tables['Hazard Type'].dropna().unique()
+        all_hazards = set(list(hazard_tables) + list(hazard_metrics))
 
         print(f"Creating {len(all_hazards)} hazard concepts...")
 
         #Creating concept nodes for hazards
         for hazard in all_hazards:
-            concept_id = f"hazard_{hazard.lower().replace(' ', '_').replace('%', 'and')}"
+            concept_id = f"hazard_{hazard.lower().replace(' ', '_').replace('&', 'and')}"
             synonyms = self._get_hazard_synonyms(hazard)
 
             self.create_concept(
@@ -118,20 +121,22 @@ class ContextGraph:
                 synonyms = synonyms
             )
 
-            print("Created: {hazard}")
+            print(f"Created: {hazard}")
 
     """Building the MAPS_TO edges between concepts and features"""
     def _link_hazards_to_features(self):
         query = """
         MATCH (f:Feature)
-        WHERE f.description CONTAINS 'HAZARD:'
+        WHERE f.description CONTAINS 'Hazard:'
         WITH f,
-            split(f.description, '|')[0] as hazard_part
+            [part IN split(f.description, '|') 
+            WHERE trim(part) STARTS WITH 'Hazard:'][0] as hazard_part
         WITH f,
             trim(replace(hazard_part, 'Hazard:', '')) as hazard_name
+        WHERE hazard_name IS NOT NULL AND hazard_name <> ''
         MATCH (c:Concept)
         WHERE c.name = hazard_name
-        MERGE (c)-[:MAPS_TO] -> (f)
+        MERGE (c)-[:MAPS_TO]->(f)
         """
 
         with self.driver.session() as session:
@@ -139,7 +144,17 @@ class ContextGraph:
             summary = result.consume()
             print(f"Created {summary.counters.relationships_created} MAPS_TO relationships")
 
+    """Get col names sotred on feature nodes"""
+    def _get_feature_columns(self, feature_id: str) -> list:
+        query = """
+        MATCH (f:Feature {id: $id})
+        RETURN f.columns as columns
+        """
 
+        with self.driver.session() as session:
+            result = session.run(query, id = feature_id)
+            record = result.single()
+            return record['columns'] if record and record['columns'] else []
 
     def close(self):
         self.driver.close()
@@ -191,6 +206,97 @@ class ContextGraph:
             result = session.run(query, name=concept_name)
             return [dict(record) for record in result]
 
+    def retrieve_context(self, query: str) -> dict:
+        """
+        Main retreival interface for SQL agent.
+        Input of natural language query.
+        Output of relevant data tables.
+        """
+
+        import re
+
+        # Keyword extraction
+        keywords = [word.lower() for word in re.findall(r'\w+', query)]
+
+        #Matching concepts to features
+        matched_features = []
+        concepts_matched = []
+
+        for keyword in keywords:
+            results = self.resolve_concept(keyword)
+            
+            if results:
+                concepts_matched.append(keyword)
+                matched_features.extend(results)
+
+        #Deduplicate
+        seen = set()
+        unique_features = []
+        for f in matched_features:
+            if f['feature_id'] not in seen:
+                seen.add(f['feature_id'])
+                unique_features.append(f)
+
+        #Format for SQL Agent
+        return {
+            "query": query,
+            "concepts_matched": list(set(concepts_matched)),
+            "database": "disaster_ai_db.duckdb",
+            "num_tables": len(unique_features),
+            "tables": [
+                {
+                    "table_name": f['feature_id'],
+                    "columns": self._get_feature_columns(f['feature_id']),
+                    "source": f['source'],
+                    "aggregation": f.get('agg', 'unknown')
+                }
+                for f in unique_features
+            ]
+        }
+
+    def _normalize_id(self, name: str) -> str:
+        """Normalize table name for matching - lowercase, underscores only"""
+        return name.lower().replace('-', '_')
+
+    def enrich_from_duckdb(self, duckdb_path: str):
+        import duckdb
+
+        conn = duckdb.connect(duckdb_path)
+        tables = conn.execute("SHOW TABLES").fetchall()
+        print(f"Found {len(tables)} tables in DuckDB")
+
+        enriched = 0
+        not_found = 0
+
+        for (table_name,) in tables:
+            columns = conn.execute(f"DESCRIBE {table_name}").fetchall()
+            column_names = [col[0] for col in columns]
+
+            # Normalize DuckDB name and match against normalized Feature IDs
+            query = """
+            MATCH (f:Feature)
+            WHERE toLower(replace(f.id, '-', '_')) = $normalized
+            SET f.columns = $columns
+            RETURN f.id
+            """
+            with self.driver.session() as session:
+                result = session.run(
+                    query,
+                    normalized=self._normalize_id(table_name),
+                    columns=column_names
+                )
+                records = result.data()
+
+                if records:
+                    enriched += 1
+                    print(f"Enriched: {table_name}")
+                else:
+                    not_found += 1
+                    print(f"No Feature node found for: {table_name}")
+
+        conn.close()
+        print(f"\n{enriched} enriched, {not_found} not matched.")
+        
 
 def load_schema_from_yaml(yaml_path: str = "config/schema.yaml") -> dict:
     """Load schema definition from YAML file."""
